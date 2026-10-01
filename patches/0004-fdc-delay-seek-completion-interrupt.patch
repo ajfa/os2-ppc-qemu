@@ -1,0 +1,99 @@
+--- a/hw/block/fdc.c
++++ b/hw/block/fdc.c
+@@ -1105,6 +1105,7 @@
+     fdctrl->msr = FD_MSR_RQM;
+     fdctrl->reset_sensei = 0;
+     timer_del(fdctrl->result_timer);
++    timer_del(fdctrl->seek_timer);
+     /* FIFO state */
+     fdctrl->data_pos = 0;
+     fdctrl->data_len = 0;
+@@ -1999,6 +2000,25 @@
+     fdctrl_to_result_phase(fdctrl, 1);
+ }
+ 
++/*
++ * A real drive needs milliseconds to step the head, and drivers written for
++ * it (the IBM OS/2 PowerPC floppy driver) only wait for the seek interrupt
++ * after issuing the command.  Complete the movement now, interrupt later.
++ */
++static void fdctrl_seek_done(void *opaque)
++{
++    FDCtrl *fdctrl = opaque;
++
++    fdctrl->status0 |= FD_SR0_SEEK;
++    fdctrl_raise_irq(fdctrl);
++}
++
++static void fdctrl_seek_start(FDCtrl *fdctrl)
++{
++    timer_mod(fdctrl->seek_timer,
++              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5 * SCALE_MS);
++}
++
+ static void fdctrl_handle_recalibrate(FDCtrl *fdctrl, int direction)
+ {
+     FDrive *cur_drv;
+@@ -2007,9 +2027,7 @@
+     cur_drv = get_cur_drv(fdctrl);
+     fd_recalibrate(cur_drv);
+     fdctrl_to_command_phase(fdctrl);
+-    /* Raise Interrupt */
+-    fdctrl->status0 |= FD_SR0_SEEK;
+-    fdctrl_raise_irq(fdctrl);
++    fdctrl_seek_start(fdctrl);
+ }
+ 
+ static void fdctrl_handle_sense_interrupt_status(FDCtrl *fdctrl, int direction)
+@@ -2047,9 +2065,7 @@
+      * there is a medium inserted of if it's banging the head against the drive.
+      */
+     fd_seek(cur_drv, cur_drv->head, fdctrl->fifo[2], cur_drv->sect, 1);
+-    /* Raise Interrupt */
+-    fdctrl->status0 |= FD_SR0_SEEK;
+-    fdctrl_raise_irq(fdctrl);
++    fdctrl_seek_start(fdctrl);
+ }
+ 
+ static void fdctrl_handle_perpendicular_mode(FDCtrl *fdctrl, int direction)
+@@ -2122,9 +2138,7 @@
+                 cur_drv->track + fdctrl->fifo[2], cur_drv->sect, 1);
+     }
+     fdctrl_to_command_phase(fdctrl);
+-    /* Raise Interrupt */
+-    fdctrl->status0 |= FD_SR0_SEEK;
+-    fdctrl_raise_irq(fdctrl);
++    fdctrl_seek_start(fdctrl);
+ }
+ 
+ static void fdctrl_handle_relative_seek_out(FDCtrl *fdctrl, int direction)
+@@ -2140,9 +2154,7 @@
+                 cur_drv->track - fdctrl->fifo[2], cur_drv->sect, 1);
+     }
+     fdctrl_to_command_phase(fdctrl);
+-    /* Raise Interrupt */
+-    fdctrl->status0 |= FD_SR0_SEEK;
+-    fdctrl_raise_irq(fdctrl);
++    fdctrl_seek_start(fdctrl);
+ }
+ 
+ /*
+@@ -2368,6 +2380,8 @@
+     fdctrl->fifo_size = 512;
+     fdctrl->result_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                              fdctrl_result_timer, fdctrl);
++    fdctrl->seek_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                      fdctrl_seek_done, fdctrl);
+ 
+     fdctrl->version = 0x90; /* Intel 82078 controller */
+     fdctrl->config = FD_CONFIG_EIS | FD_CONFIG_EFIFO; /* Implicit seek, polling & FIFO enabled */
+--- a/hw/block/fdc-internal.h
++++ b/hw/block/fdc-internal.h
+@@ -93,6 +93,7 @@
+     qemu_irq irq;
+     /* Controller state */
+     QEMUTimer *result_timer;
++    QEMUTimer *seek_timer;
+     int dma_chann;
+     uint8_t phase;
+     IsaDma *dma;

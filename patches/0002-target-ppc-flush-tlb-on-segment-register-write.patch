@@ -1,0 +1,15 @@
+--- a/target/ppc/mmu_helper.c
++++ b/target/ppc/mmu_helper.c
+@@ -377,7 +377,11 @@
+             }
+         }
+ #else
+-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
++        /*
++         * Data accesses right after mtsr already use the new segment on
++         * a 60x; the IBM microkernel switches SR0 and copies with no isync.
++         */
++        tlb_flush(env_cpu(env));
+ #endif
+     }
+ }

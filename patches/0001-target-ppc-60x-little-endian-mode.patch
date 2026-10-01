@@ -1,0 +1,338 @@
+--- a/target/ppc/cpu.h
++++ b/target/ppc/cpu.h
+@@ -785,6 +785,8 @@
+     POWERPC_FLAG_SMT_1LPAR = 0x00800000,
+     /* Has BHRB */
+     POWERPC_FLAG_BHRB      = 0x01000000,
++    /* MSR[LE] munges the low address bits instead of swapping bytes (60x) */
++    POWERPC_FLAG_LE_MUNGE  = 0x02000000,
+ };
+ 
+ /*
+--- a/target/ppc/cpu_init.c
++++ b/target/ppc/cpu_init.c
+@@ -3470,7 +3470,7 @@
+     pcc->bus_model = PPC_FLAGS_INPUT_6xx;
+     pcc->bfd_mach = bfd_mach_ppc_604;
+     pcc->flags = POWERPC_FLAG_SE | POWERPC_FLAG_BE |
+-                 POWERPC_FLAG_PMM | POWERPC_FLAG_BUS_CLK;
++                 POWERPC_FLAG_PMM | POWERPC_FLAG_BUS_CLK | POWERPC_FLAG_LE_MUNGE;
+ }
+ 
+ static void init_proc_604E(CPUPPCState *env)
+@@ -3516,7 +3516,7 @@
+     pcc->bus_model = PPC_FLAGS_INPUT_6xx;
+     pcc->bfd_mach = bfd_mach_ppc_604;
+     pcc->flags = POWERPC_FLAG_SE | POWERPC_FLAG_BE |
+-                 POWERPC_FLAG_PMM | POWERPC_FLAG_BUS_CLK;
++                 POWERPC_FLAG_PMM | POWERPC_FLAG_BUS_CLK | POWERPC_FLAG_LE_MUNGE;
+ }
+ 
+ static void init_proc_740(CPUPPCState *env)
+--- a/target/ppc/excp_helper.c
++++ b/target/ppc/excp_helper.c
+@@ -521,7 +521,7 @@
+     msr = env->msr & ~0x783f0000ULL;
+ 
+     /* new interrupt handler msr preserves ME unless explicitly overridden */
+-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
++    new_msr = env->msr & (((target_ulong)1 << MSR_ME) | ((target_ulong)1 << MSR_ILE));
+ 
+     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
+     if (excp == POWERPC_EXCP_HV_EMU) {
+@@ -664,7 +664,7 @@
+     msr = env->msr & ~0x783f0000ULL;
+ 
+     /* new interrupt handler msr preserves ME unless explicitly overridden */
+-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
++    new_msr = env->msr & (((target_ulong)1 << MSR_ME) | ((target_ulong)1 << MSR_ILE));
+ 
+     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
+     if (excp == POWERPC_EXCP_HV_EMU) {
+@@ -814,7 +814,7 @@
+     msr = env->msr & ~0x783f0000ULL;
+ 
+     /* new interrupt handler msr preserves ME unless explicitly overridden */
+-    new_msr = env->msr & ((target_ulong)1 << MSR_ME);
++    new_msr = env->msr & (((target_ulong)1 << MSR_ME) | ((target_ulong)1 << MSR_ILE));
+ 
+     /* HV emu assistance interrupt only exists on server arch 2.05 or later */
+     if (excp == POWERPC_EXCP_HV_EMU) {
+--- a/target/ppc/tcg-excp_helper.c
++++ b/target/ppc/tcg-excp_helper.c
+@@ -210,6 +210,55 @@
+ 
+ #ifndef CONFIG_USER_ONLY
+ 
++/* Access size of a load/store, for the ones a 60x can take misaligned */
++static unsigned ppc_ldst_size(uint32_t insn)
++{
++    unsigned op = insn >> 26, xo = (insn >> 1) & 0x3ff;
++
++    switch (op) {
++    case 32 ... 33: case 36 ... 37: case 46 ... 49: case 52 ... 53:
++        return 4;
++    case 34 ... 35: case 38 ... 39:
++        return 1;
++    case 40 ... 45:
++        return 2;
++    case 50 ... 51: case 54 ... 55:
++        return 8;
++    case 31:
++        switch (xo) {
++        case 279: case 311: case 343: case 375: case 407: case 439:
++        case 790: case 918:
++            return 2;
++        case 599: case 631: case 727: case 759:
++            return 8;
++        case 87: case 119: case 215: case 247:
++            return 1;
++        default:
++            return 4;
++        }
++    }
++    return 4;
++}
++
++/*
++ * DSISR for an alignment interrupt as the 60x reports it: the bits that
++ * identify the instruction in 15-21, then rS/rD and rA.
++ */
++static uint32_t ppc_align_dsisr(uint32_t insn)
++{
++    uint32_t d = (insn & 0x03FF0000) >> 16;
++
++    if ((insn >> 26) == 31) {
++        d |= ((insn >> 1) & 3) << 15;           /* insn bits 29:30 */
++        d |= ((insn >> 6) & 1) << 14;           /* insn bit 25 */
++        d |= ((insn >> 7) & 0xf) << 10;         /* insn bits 21:24 */
++    } else {
++        d |= ((insn >> 26) & 1) << 14;          /* insn bit 5 */
++        d |= ((insn >> 27) & 0xf) << 10;        /* insn bits 1:4 */
++    }
++    return d;
++}
++
+ void ppc_cpu_do_unaligned_access(CPUState *cs, vaddr vaddr,
+                                  MMUAccessType access_type,
+                                  int mmu_idx, uintptr_t retaddr)
+@@ -221,6 +270,21 @@
+     cpu_restore_state(cs, retaddr);
+     insn = ppc_ldl_code(env, env->nip);
+ 
++    if ((env->flags & POWERPC_FLAG_LE_MUNGE) && FIELD_EX64(env->msr, MSR, LE)) {
++        unsigned size = ppc_ldst_size(insn);
++
++        /* report the program's effective address, not the munged one */
++        if (size < 8) {
++            vaddr ^= 8 - size;
++        }
++        env->spr[SPR_DAR] = vaddr;
++        /* the exception code only ORs error_code's rS/rA bits in */
++        env->spr[SPR_DSISR] = ppc_align_dsisr(insn);
++        cs->exception_index = POWERPC_EXCP_ALIGN;
++        env->error_code = 0;
++        cpu_loop_exit(cs);
++    }
++
+     switch (env->mmu_model) {
+     case POWERPC_MMU_SOFT_4xx:
+         env->spr[SPR_40x_DEAR] = vaddr;
+@@ -419,10 +483,20 @@
+     return !!(env->msr & ((target_ulong)1 << MSR_LE));
+ }
+ 
++static bool ppc_le_munge(CPUPPCState *env)
++{
++    return (env->flags & POWERPC_FLAG_LE_MUNGE) && FIELD_EX64(env->msr, MSR, LE);
++}
++
+ uint32_t ppc_ldl_code(CPUArchState *env, target_ulong addr)
+ {
+-    uint32_t insn = cpu_ldl_code(env, addr);
++    uint32_t insn;
+ 
++    if (ppc_le_munge(env)) {
++        /* 60x little-endian: the word sits big-endian at addr ^ 4 */
++        return cpu_ldl_code(env, addr ^ 4);
++    }
++    insn = cpu_ldl_code(env, addr);
+     if (insn_need_byteswap(env)) {
+         insn = bswap32(insn);
+     }
+@@ -522,7 +596,17 @@
+ 
+ void helper_rfi(CPUPPCState *env)
+ {
+-    do_rfi(env, env->spr[SPR_SRR0], env->spr[SPR_SRR1] & 0xfffffffful);
++    target_ulong msr = env->spr[SPR_SRR1] & 0xfffffffful;
++
++    /*
++     * Classic 32-bit PowerPC: rfi reloads MSR[16-31] only, so ILE and the
++     * rest of the upper half survive; SRR1 never held them.
++     */
++    if (env->mmu_model == POWERPC_MMU_32B ||
++        env->mmu_model == POWERPC_MMU_SOFT_6xx) {
++        msr = (env->msr & 0xffff0000ul) | (msr & 0xffff);
++    }
++    do_rfi(env, env->spr[SPR_SRR0], msr);
+ }
+ 
+ #ifdef TARGET_PPC64
+--- a/target/ppc/translate.c
++++ b/target/ppc/translate.c
+@@ -172,6 +172,7 @@
+     uint32_t opcode;
+     /* Routine used to access memory */
+     bool pr, hv, dr, le_mode;
++    bool le_munge;      /* le_mode done the 60x way: address XOR, BE lanes */
+     bool lazy_tlb_flush;
+     bool need_access_type;
+     int mem_idx;
+@@ -212,6 +213,9 @@
+ /* Return true iff byteswap is needed in a scalar memop */
+ static inline bool need_byteswap(const DisasContext *ctx)
+ {
++    if (ctx->le_munge) {
++        return false;
++    }
+ #if TARGET_BIG_ENDIAN
+      return ctx->le_mode;
+ #else
+@@ -2601,12 +2605,33 @@
+ #define DEF_MEMOP(op) ((op) | ctx->default_tcg_memop_mask)
+ #define BSWAP_MEMOP(op) ((op) | (ctx->default_tcg_memop_mask ^ MO_BSWAP))
+ 
++/*
++ * 601/603/604 little-endian mode: the bus stays big-endian and the CPU
++ * XORs the low EA bits with 8 - size, so memory holds every doubleword
++ * byte-reversed.  Doubleword accesses are left alone.
++ */
++/* a 60x in little-endian mode takes an alignment interrupt on misalignment */
++#define MUNGE_MOP(op) \
++    ((op) | (ctx->le_munge && memop_size(op) > 1 ? MO_ALIGN : 0))
++
++static TCGv gen_munge_ea(DisasContext *ctx, TCGv ea, MemOp op)
++{
++    TCGv t;
++
++    if (!ctx->le_munge || memop_size(op) >= 8) {
++        return ea;
++    }
++    t = tcg_temp_new();
++    tcg_gen_xori_tl(t, ea, 8 - memop_size(op));
++    return t;
++}
++
+ #define GEN_QEMU_LOAD_TL(ldop, op)                                      \
+ static void glue(gen_qemu_, ldop)(DisasContext *ctx,                    \
+                                   TCGv val,                             \
+                                   TCGv addr)                            \
+ {                                                                       \
+-    tcg_gen_qemu_ld_tl(val, addr, ctx->mem_idx, op);                    \
++    tcg_gen_qemu_ld_tl(val, gen_munge_ea(ctx, addr, op), ctx->mem_idx, MUNGE_MOP(op)); \
+ }
+ 
+ GEN_QEMU_LOAD_TL(ld8u,  DEF_MEMOP(MO_UB))
+@@ -2623,7 +2648,7 @@
+                                              TCGv_i64 val,          \
+                                              TCGv addr)             \
+ {                                                                   \
+-    tcg_gen_qemu_ld_i64(val, addr, ctx->mem_idx, op);               \
++    tcg_gen_qemu_ld_i64(val, gen_munge_ea(ctx, addr, op), ctx->mem_idx, MUNGE_MOP(op)); \
+ }
+ 
+ GEN_QEMU_LOAD_64(ld8u,  DEF_MEMOP(MO_UB))
+@@ -2641,7 +2666,7 @@
+                                   TCGv val,                             \
+                                   TCGv addr)                            \
+ {                                                                       \
+-    tcg_gen_qemu_st_tl(val, addr, ctx->mem_idx, op);                    \
++    tcg_gen_qemu_st_tl(val, gen_munge_ea(ctx, addr, op), ctx->mem_idx, MUNGE_MOP(op)); \
+ }
+ 
+ #if defined(TARGET_PPC64) || !defined(CONFIG_USER_ONLY)
+@@ -2658,7 +2683,7 @@
+                                               TCGv_i64 val,       \
+                                               TCGv addr)          \
+ {                                                                 \
+-    tcg_gen_qemu_st_i64(val, addr, ctx->mem_idx, op);             \
++    tcg_gen_qemu_st_i64(val, gen_munge_ea(ctx, addr, op), ctx->mem_idx, MUNGE_MOP(op)); \
+ }
+ 
+ GEN_QEMU_STORE_64(st8,  DEF_MEMOP(MO_UB))
+@@ -2962,6 +2987,7 @@
+ 
+     gen_set_access_type(ctx, ACCESS_RES);
+     gen_addr_reg_index(ctx, t0);
++    t0 = gen_munge_ea(ctx, t0, memop);
+     tcg_gen_qemu_ld_tl(gpr, t0, ctx->mem_idx, DEF_MEMOP(memop) | MO_ALIGN);
+     tcg_gen_mov_tl(cpu_reserve, t0);
+     tcg_gen_movi_tl(cpu_reserve_length, memop_size(memop));
+@@ -3201,6 +3227,7 @@
+     tcg_gen_mov_tl(cr0, cpu_so);
+     gen_set_access_type(ctx, ACCESS_RES);
+     gen_addr_reg_index(ctx, EA);
++    EA = gen_munge_ea(ctx, EA, memop);
+     tcg_gen_brcond_tl(TCG_COND_NE, EA, cpu_reserve, lfail);
+     tcg_gen_brcondi_tl(TCG_COND_NE, cpu_reserve_length, memop_size(memop), lfail);
+ 
+@@ -6513,7 +6540,9 @@
+     ctx->access_type = -1;
+     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
+     ctx->le_mode = (hflags >> HFLAGS_LE) & 1;
+-    ctx->default_tcg_memop_mask = ctx->le_mode ? MO_LE : MO_BE;
++    ctx->le_munge = ctx->le_mode && (env->flags & POWERPC_FLAG_LE_MUNGE);
++    ctx->default_tcg_memop_mask =
++        ctx->le_mode && !ctx->le_munge ? MO_LE : MO_BE;
+     ctx->flags = env->flags;
+ #if defined(TARGET_PPC64)
+     ctx->excp_model = env->excp_model;
+@@ -6577,7 +6606,8 @@
+               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
+ 
+     ctx->cia = pc = ctx->base.pc_next;
+-    insn = translator_ldl_swap(env, dcbase, pc, need_byteswap(ctx));
++    insn = translator_ldl_swap(env, dcbase, ctx->le_munge ? pc ^ 4 : pc,
++                               need_byteswap(ctx));
+     ctx->base.pc_next = pc += 4;
+ 
+     if (!is_prefix_insn(ctx, insn)) {
+--- a/target/ppc/translate/fixedpoint-impl.c.inc
++++ b/target/ppc/translate/fixedpoint-impl.c.inc
+@@ -35,9 +35,11 @@
+     ea = do_ea_calc(ctx, ra, displ);
+     mop ^= ctx->default_tcg_memop_mask;
+     if (store) {
+-        tcg_gen_qemu_st_tl(cpu_gpr[rt], ea, ctx->mem_idx, mop);
++        tcg_gen_qemu_st_tl(cpu_gpr[rt], gen_munge_ea(ctx, ea, mop),
++                           ctx->mem_idx, MUNGE_MOP(mop));
+     } else {
+-        tcg_gen_qemu_ld_tl(cpu_gpr[rt], ea, ctx->mem_idx, mop);
++        tcg_gen_qemu_ld_tl(cpu_gpr[rt], gen_munge_ea(ctx, ea, mop),
++                           ctx->mem_idx, MUNGE_MOP(mop));
+     }
+     if (update) {
+         tcg_gen_mov_tl(cpu_gpr[ra], ea);
+--- a/target/ppc/translate/fp-impl.c.inc
++++ b/target/ppc/translate/fp-impl.c.inc
+@@ -729,7 +729,8 @@
+ static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
+ {
+     TCGv_i32 tmp = tcg_temp_new_i32();
+-    tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
++    tcg_gen_qemu_ld_i32(tmp, gen_munge_ea(ctx, addr, MO_UL), ctx->mem_idx, MUNGE_MOP
++                        (DEF_MEMOP(MO_UL)));
+     gen_helper_todouble(dest, tmp);
+ }
+ 
+@@ -873,7 +874,8 @@
+ {
+     TCGv_i32 tmp = tcg_temp_new_i32();
+     gen_helper_tosingle(tmp, src);
+-    tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
++    tcg_gen_qemu_st_i32(tmp, gen_munge_ea(ctx, addr, MO_UL), ctx->mem_idx, MUNGE_MOP
++                        (DEF_MEMOP(MO_UL)));
+ }
+ 
+ /* stfdepx (external PID lfdx) */

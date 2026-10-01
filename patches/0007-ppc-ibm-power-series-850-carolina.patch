@@ -1,0 +1,1122 @@
+--- a/hw/ppc/carolina.c
++++ b/hw/ppc/carolina.c
+@@ -0,0 +1,1109 @@
++/*
++ * IBM "Carolina" PReP board: Power Series 830/850 (6050/6070), RS/6000 7248-43P
++ *
++ * Built to run the original IBM firmware (P93H1904.IMG) and
++ * OS/2 Warp, PowerPC Edition.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/units.h"
++#include "qemu/log.h"
++#include "qemu/error-report.h"
++#include "qemu/datadir.h"
++#include "qapi/error.h"
++#include "hw/boards.h"
++#include "hw/loader.h"
++#include "hw/irq.h"
++#include "hw/or-irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/pci/pci.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/pci_bus.h"
++#include "hw/pci/pci_host.h"
++#include "hw/isa/isa.h"
++#include "hw/intc/i8259.h"
++#include "hw/rtc/mc146818rtc.h"
++#include "hw/rtc/m48t59.h"
++#include "hw/ppc/ppc.h"
++#include "hw/scsi/scsi.h"
++#include "hw/ide/isa.h"
++#include "hw/input/i8042.h"
++#include "hw/ide/ide-dev.h"
++#include "system/blockdev.h"
++#include "system/reset.h"
++#include "system/address-spaces.h"
++#include "system/cpus.h"
++#include "system/hw_accel.h"
++#include "hw/nmi.h"
++#include "cpu.h"
++
++#define BIOS_ADDR   0xfff00000
++#define BIOS_SIZE   (1 * MiB)
++#define CAROLINA_IO_BASE 0x80000000
++
++/* ------------------------------------------------------------------ */
++/* Host bridge: IBM 27-82660 (Lanai) as seen from the CPU             */
++
++#define TYPE_CAROLINA_HB_DEV  "ibm-82660"
++#define TYPE_CAROLINA_PCIHOST "carolina-pcihost"
++
++OBJECT_DECLARE_SIMPLE_TYPE(CarolinaHBDev, CAROLINA_HB_DEV)
++OBJECT_DECLARE_SIMPLE_TYPE(CarolinaPCIState, CAROLINA_PCIHOST)
++
++#define CAROLINA_BANKS      8
++#define CAROLINA_MAX_MIRROR 64
++
++struct CarolinaHBDev {
++    PCIDevice dev;
++
++    /* DRAM as the 660 sees it: one bank per SIMM side */
++    MemoryRegion *ram;
++    MemoryRegion banks;
++    uint32_t bank_mb[CAROLINA_BANKS];
++    uint32_t bank_offset_mb[CAROLINA_BANKS];
++    MemoryRegion *alias[CAROLINA_BANKS][CAROLINA_MAX_MIRROR];
++    int nalias[CAROLINA_BANKS];
++};
++
++static CarolinaHBDev *carolina_hb;
++
++struct CarolinaPCIState {
++    PCIHostState parent_obj;
++
++    OrIRQState *or_irq;
++    qemu_irq pci_irqs[PCI_NUM_PINS];
++    PCIBus pci_bus;
++    AddressSpace pci_io_as;
++    MemoryRegion pci_io;
++    MemoryRegion pci_io_unassigned;
++    MemoryRegion pci_io_non_contiguous;
++    MemoryRegion pci_memory;
++    MemoryRegion pci_intack;
++    MemoryRegion bm;
++    MemoryRegion bm_ram_alias;
++    MemoryRegion bm_pci_memory_alias;
++    AddressSpace bm_as;
++    CarolinaHBDev pci_dev;
++    int contiguous_map;
++
++    /* little-endian mode: undo the CPU's address munging on the way out */
++    MemoryRegion le_window;
++    MemoryRegion le_root;
++    MemoryRegion le_alias[5];
++    AddressSpace le_as;
++};
++
++static uint32_t carolina_cfg_addr(hwaddr addr)
++{
++    int i;
++
++    for (i = 0; i < 11; i++) {
++        if ((addr & (1 << (11 + i))) != 0) {
++            break;
++        }
++    }
++    return (addr & 0x7ff) | (i << 11);
++}
++
++static void carolina_cfg_write(void *opaque, hwaddr addr, uint64_t val,
++                               unsigned size)
++{
++    PCIHostState *phb = PCI_HOST_BRIDGE(opaque);
++    pci_data_write(phb->bus, carolina_cfg_addr(addr), val, size);
++}
++
++static uint64_t carolina_cfg_read(void *opaque, hwaddr addr, unsigned size)
++{
++    PCIHostState *phb = PCI_HOST_BRIDGE(opaque);
++    return pci_data_read(phb->bus, carolina_cfg_addr(addr), size);
++}
++
++static const MemoryRegionOps carolina_cfg_ops = {
++    .read = carolina_cfg_read,
++    .write = carolina_cfg_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static uint64_t carolina_intack_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return pic_read_irq(isa_pic);
++}
++
++static void carolina_intack_write(void *opaque, hwaddr addr, uint64_t data,
++                                  unsigned size)
++{
++}
++
++static const MemoryRegionOps carolina_intack_ops = {
++    .read = carolina_intack_read,
++    .write = carolina_intack_write,
++    .valid.max_access_size = 1,
++};
++
++static hwaddr carolina_io_address(CarolinaPCIState *s, hwaddr addr)
++{
++    if (s->contiguous_map == 0) {
++        return addr & 0xffff;
++    }
++    return (addr & 0x1f) | ((addr & 0x007ff000) >> 7);
++}
++
++static uint64_t carolina_io_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CarolinaPCIState *s = opaque;
++    uint8_t buf[4];
++
++    addr = carolina_io_address(s, addr);
++    address_space_read(&s->pci_io_as, addr + CAROLINA_IO_BASE,
++                       MEMTXATTRS_UNSPECIFIED, buf, size);
++    if (size == 1) {
++        return buf[0];
++    } else if (size == 2) {
++        return lduw_le_p(buf);
++    }
++    return ldl_le_p(buf);
++}
++
++static void carolina_io_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    CarolinaPCIState *s = opaque;
++    uint8_t buf[4];
++
++    addr = carolina_io_address(s, addr);
++    if (size == 1) {
++        buf[0] = val;
++    } else if (size == 2) {
++        stw_le_p(buf, val);
++    } else {
++        stl_le_p(buf, val);
++    }
++    address_space_write(&s->pci_io_as, addr + CAROLINA_IO_BASE,
++                        MEMTXATTRS_UNSPECIFIED, buf, size);
++}
++
++static const MemoryRegionOps carolina_io_ops = {
++    .read = carolina_io_read,
++    .write = carolina_io_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.max_access_size = 4,
++    .impl.unaligned = true,
++    .valid.unaligned = true,
++};
++
++/* Everything nobody decodes: log it, float the bus */
++static uint64_t carolina_unassigned_read(void *opaque, hwaddr addr,
++                                         unsigned size)
++{
++    qemu_log_mask(LOG_UNIMP, "carolina: io read  %04x/%u\n",
++                  (unsigned)addr, size);
++    return size == 1 ? 0xff : size == 2 ? 0xffff : 0xffffffff;
++}
++
++static void carolina_unassigned_write(void *opaque, hwaddr addr, uint64_t val,
++                                      unsigned size)
++{
++    qemu_log_mask(LOG_UNIMP, "carolina: io write %04x/%u = %" PRIx64 "\n",
++                  (unsigned)addr, size, val);
++}
++
++static const MemoryRegionOps carolina_unassigned_ops = {
++    .read = carolina_unassigned_read,
++    .write = carolina_unassigned_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static int carolina_map_irq(PCIDevice *pci_dev, int irq_num)
++{
++    return irq_num;
++}
++
++static void carolina_set_irq(void *opaque, int irq_num, int level)
++{
++    CarolinaPCIState *s = opaque;
++    qemu_set_irq(s->pci_irqs[irq_num], level);
++}
++
++static AddressSpace *carolina_iommu(PCIBus *bus, void *opaque, int devfn)
++{
++    CarolinaPCIState *s = opaque;
++    return &s->bm_as;
++}
++
++static const PCIIOMMUOps carolina_iommu_ops = {
++    .get_address_space = carolina_iommu,
++};
++
++static void carolina_change_gpio(void *opaque, int n, int level)
++{
++    CarolinaPCIState *s = opaque;
++    s->contiguous_map = level;
++}
++
++/*
++ * In little-endian mode a 60x keeps big-endian byte lanes and XORs the low
++ * address bits with 8 - size.  DRAM is left that way; everything behind
++ * the bridge gets the address unmunged and the bytes put in LE order.
++ */
++static uint64_t carolina_le_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CarolinaPCIState *s = opaque;
++    uint8_t buf[8];
++
++    addr = CAROLINA_IO_BASE + (addr ^ (8 - size));
++    address_space_read(&s->le_as, addr, MEMTXATTRS_UNSPECIFIED, buf, size);
++    return ldn_le_p(buf, size);
++}
++
++static void carolina_le_write(void *opaque, hwaddr addr, uint64_t val,
++                              unsigned size)
++{
++    CarolinaPCIState *s = opaque;
++    uint8_t buf[8];
++
++    addr = CAROLINA_IO_BASE + (addr ^ (8 - size));
++    stn_le_p(buf, size, val);
++    address_space_write(&s->le_as, addr, MEMTXATTRS_UNSPECIFIED, buf, size);
++}
++
++static const MemoryRegionOps carolina_le_ops = {
++    .read = carolina_le_read,
++    .write = carolina_le_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++static void carolina_le_gpio(void *opaque, int n, int level)
++{
++    CarolinaPCIState *s = opaque;
++
++    qemu_log_mask(LOG_UNIMP, "carolina: little-endian mode %s\n",
++                  level ? "on" : "off");
++    memory_region_set_enabled(&s->le_window, level);
++}
++
++static void carolina_le_init(CarolinaPCIState *s)
++{
++    PCIHostState *h = PCI_HOST_BRIDGE(s);
++    Object *obj = OBJECT(s);
++    MemoryRegion *sysmem = get_system_memory();
++    struct {
++        MemoryRegion *mr;
++        hwaddr base;
++        int prio;
++    } map[] = {
++        { &s->pci_io, CAROLINA_IO_BASE, 0 },
++        { &s->pci_io_non_contiguous, CAROLINA_IO_BASE, 1 },
++        { &h->mmcfg, 0x80800000, 2 },
++        { &s->pci_intack, 0xbffffff0, 0 },
++        { &s->pci_memory, 0xc0000000, 0 },
++    };
++    int i;
++
++    memory_region_init(&s->le_root, obj, "carolina-le-root", 4 * GiB);
++    for (i = 0; i < ARRAY_SIZE(map); i++) {
++        memory_region_init_alias(&s->le_alias[i], obj, "carolina-le-alias",
++                                 map[i].mr, 0, memory_region_size(map[i].mr));
++        memory_region_add_subregion_overlap(&s->le_root, map[i].base,
++                                            &s->le_alias[i], map[i].prio);
++    }
++    address_space_init(&s->le_as, &s->le_root, "carolina-le");
++
++    memory_region_init_io(&s->le_window, obj, &carolina_le_ops, s,
++                          "carolina-le-window", 0xfff00000 - CAROLINA_IO_BASE);
++    /* forwards into regions this same bridge owns */
++    s->le_window.disable_reentrancy_guard = true;
++    memory_region_add_subregion_overlap(sysmem, CAROLINA_IO_BASE,
++                                        &s->le_window, 10);
++    memory_region_set_enabled(&s->le_window, false);
++}
++
++static void carolina_pcihost_realize(DeviceState *d, Error **errp)
++{
++    SysBusDevice *dev = SYS_BUS_DEVICE(d);
++    PCIHostState *h = PCI_HOST_BRIDGE(dev);
++    CarolinaPCIState *s = CAROLINA_PCIHOST(dev);
++    MemoryRegion *sysmem = get_system_memory();
++    int i;
++
++    s->or_irq = OR_IRQ(object_new(TYPE_OR_IRQ));
++    object_property_set_int(OBJECT(s->or_irq), "num-lines", PCI_NUM_PINS,
++                            &error_fatal);
++    qdev_realize(DEVICE(s->or_irq), NULL, &error_fatal);
++    sysbus_init_irq(dev, &s->or_irq->out_irq);
++    for (i = 0; i < PCI_NUM_PINS; i++) {
++        s->pci_irqs[i] = qdev_get_gpio_in(DEVICE(s->or_irq), i);
++    }
++    qdev_init_gpio_in(d, carolina_change_gpio, 1);
++    qdev_init_gpio_in_named(d, carolina_le_gpio, "little-endian", 1);
++
++    pci_bus_irqs(&s->pci_bus, carolina_set_irq, s, PCI_NUM_PINS);
++    pci_bus_map_irqs(&s->pci_bus, carolina_map_irq);
++
++    memory_region_init_io(&h->conf_mem, OBJECT(h), &pci_host_conf_le_ops, s,
++                          "pci-conf-idx", 4);
++    memory_region_add_subregion(&s->pci_io, 0xcf8, &h->conf_mem);
++    memory_region_init_io(&h->data_mem, OBJECT(h), &pci_host_data_le_ops, s,
++                          "pci-conf-data", 4);
++    memory_region_add_subregion(&s->pci_io, 0xcfc, &h->data_mem);
++
++    memory_region_init_io(&h->mmcfg, OBJECT(s), &carolina_cfg_ops, s,
++                          "pciio", 0x00400000);
++    memory_region_add_subregion(sysmem, 0x80800000, &h->mmcfg);
++
++    memory_region_init_io(&s->pci_intack, OBJECT(s), &carolina_intack_ops, s,
++                          "pci-intack", 1);
++    memory_region_add_subregion(sysmem, 0xbffffff0, &s->pci_intack);
++
++    qdev_realize(DEVICE(&s->pci_dev), BUS(&s->pci_bus), errp);
++    carolina_le_init(s);
++}
++
++static void carolina_pcihost_init(Object *obj)
++{
++    PCIHostState *h = PCI_HOST_BRIDGE(obj);
++    CarolinaPCIState *s = CAROLINA_PCIHOST(obj);
++    MemoryRegion *sysmem = get_system_memory();
++
++    memory_region_init(&s->pci_io, obj, "pci-io", 0x3f800000);
++    memory_region_init_io(&s->pci_io_unassigned, obj, &carolina_unassigned_ops,
++                          s, "pci-io-unassigned", 0x10000);
++    memory_region_add_subregion_overlap(&s->pci_io, 0, &s->pci_io_unassigned,
++                                        -100);
++    s->pci_io_unassigned.disable_reentrancy_guard = true;
++    memory_region_init_io(&s->pci_io_non_contiguous, obj, &carolina_io_ops, s,
++                          "pci-io-non-contiguous", 0x00800000);
++    memory_region_init(&s->pci_memory, obj, "pci-memory", 0x3f000000);
++    address_space_init(&s->pci_io_as, &s->pci_io, "carolina-io");
++    s->pci_io_non_contiguous.disable_reentrancy_guard = true;
++
++    memory_region_add_subregion(sysmem, CAROLINA_IO_BASE, &s->pci_io);
++    memory_region_add_subregion_overlap(sysmem, CAROLINA_IO_BASE,
++                                        &s->pci_io_non_contiguous, 1);
++    memory_region_add_subregion(sysmem, 0xc0000000, &s->pci_memory);
++    pci_root_bus_init(&s->pci_bus, sizeof(s->pci_bus), DEVICE(obj), NULL,
++                      &s->pci_memory, &s->pci_io, 0, TYPE_PCI_BUS);
++
++    memory_region_init(&s->bm, obj, "bm-carolina", 4 * GiB);
++    memory_region_init_alias(&s->bm_pci_memory_alias, obj, "bm-pci-memory",
++                             &s->pci_memory, 0,
++                             memory_region_size(&s->pci_memory));
++    memory_region_init_alias(&s->bm_ram_alias, obj, "bm-system",
++                             sysmem, 0, 0x80000000);
++    memory_region_add_subregion(&s->bm, 0, &s->bm_pci_memory_alias);
++    memory_region_add_subregion(&s->bm, 0x80000000, &s->bm_ram_alias);
++    address_space_init(&s->bm_as, &s->bm, "carolina-bm");
++    pci_setup_iommu(&s->pci_bus, &carolina_iommu_ops, s);
++
++    h->bus = &s->pci_bus;
++
++    object_initialize(&s->pci_dev, sizeof(s->pci_dev), TYPE_CAROLINA_HB_DEV);
++    object_property_set_int(OBJECT(&s->pci_dev), "addr", PCI_DEVFN(0, 0),
++                            NULL);
++    qdev_prop_set_bit(DEVICE(&s->pci_dev), "multifunction", false);
++}
++
++/*
++ * 0x80-0x87 bank start, 0x88-0x8f start bits 9:8, 0x90-0x97 bank end,
++ * 0x98-0x9f end bits 9:8 (all in MB, end inclusive), 0xa0 bank enable.
++ * A bank programmed larger than its SIMM side mirrors it; a bank with no
++ * SIMM behind it decodes nothing, which is how the firmware sizes memory.
++ */
++static void carolina_hb_map_banks(CarolinaHBDev *s)
++{
++    uint8_t *c = s->dev.config;
++    int b, i;
++
++    if (!s->ram) {
++        return;
++    }
++    memory_region_transaction_begin();
++    for (b = 0; b < CAROLINA_BANKS; b++) {
++        for (i = 0; i < s->nalias[b]; i++) {
++            memory_region_del_subregion(&s->banks, s->alias[b][i]);
++            object_unparent(OBJECT(s->alias[b][i]));
++            g_free(s->alias[b][i]);
++        }
++        s->nalias[b] = 0;
++    }
++    for (b = 0; b < CAROLINA_BANKS; b++) {
++        uint64_t start, end, size, phys, off;
++
++        if (!(c[0xa0] & (1 << b)) || !s->bank_mb[b]) {
++            continue;
++        }
++        start = c[0x80 + b] | ((c[0x88 + b] & 3) << 8);
++        end = c[0x90 + b] | ((c[0x98 + b] & 3) << 8);
++        if (end < start) {
++            continue;
++        }
++        size = (end - start + 1) * MiB;
++        phys = (uint64_t)s->bank_mb[b] * MiB;
++        for (off = 0; off < size && s->nalias[b] < CAROLINA_MAX_MIRROR;
++             off += phys) {
++            MemoryRegion *mr = g_new0(MemoryRegion, 1);
++
++            memory_region_init_alias(mr, OBJECT(s), "carolina-bank", s->ram,
++                                     (uint64_t)s->bank_offset_mb[b] * MiB,
++                                     MIN(phys, size - off));
++            memory_region_add_subregion_overlap(&s->banks, start * MiB + off,
++                                                mr, b);
++            s->alias[b][s->nalias[b]++] = mr;
++        }
++    }
++    memory_region_transaction_commit();
++}
++
++static void carolina_hb_config_write(PCIDevice *d, uint32_t addr,
++                                     uint32_t val, int len)
++{
++    qemu_log_mask(LOG_UNIMP, "carolina: 660 cfg write %02x/%d = %08x\n",
++                  addr, len, val);
++    pci_default_write_config(d, addr, val, len);
++    if (ranges_overlap(addr, len, 0x80, 0x21)) {
++        carolina_hb_map_banks(CAROLINA_HB_DEV(d));
++    }
++}
++
++static uint32_t carolina_hb_config_read(PCIDevice *d, uint32_t addr, int len)
++{
++    uint32_t val = pci_default_read_config(d, addr, len);
++
++    qemu_log_mask(LOG_UNIMP, "carolina: 660 cfg read  %02x/%d = %08x\n",
++                  addr, len, val);
++    return val;
++}
++
++static void carolina_hb_realize(PCIDevice *d, Error **errp)
++{
++    /* memory controller registers live above the header; keep them as RAM */
++    memset(d->wmask + 0x40, 0xff, 0xc0);
++    /* 0xc0: error status, write one to clear; we never flag errors */
++    memset(d->wmask + 0xc0, 0x00, 4);
++    memset(d->w1cmask + 0xc0, 0xff, 4);
++    d->config[PCI_CACHE_LINE_SIZE] = 0x08;
++    d->config[PCI_LATENCY_TIMER] = 0x10;
++    carolina_hb = CAROLINA_HB_DEV(d);
++}
++
++static void carolina_hb_reset(DeviceState *dev)
++{
++    CarolinaHBDev *s = CAROLINA_HB_DEV(dev);
++
++    pci_device_reset(PCI_DEVICE(dev));
++    memset(s->dev.config + 0x80, 0, 0x21);
++    carolina_hb_map_banks(s);
++}
++
++static void carolina_hb_class_init(ObjectClass *klass, const void *data)
++{
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    k->realize = carolina_hb_realize;
++    k->config_write = carolina_hb_config_write;
++    k->config_read = carolina_hb_config_read;
++    k->vendor_id = PCI_VENDOR_ID_IBM;
++    k->device_id = 0x0037;
++    k->revision = 0x00;
++    k->class_id = PCI_CLASS_BRIDGE_HOST;
++    dc->desc = "IBM 27-82660 PowerPC to PCI bridge";
++    device_class_set_legacy_reset(dc, carolina_hb_reset);
++    dc->user_creatable = false;
++}
++
++static void carolina_pcihost_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
++    dc->realize = carolina_pcihost_realize;
++    dc->fw_name = "pci";
++}
++
++/* ------------------------------------------------------------------ */
++/* Carolina system I/O beyond the generic PReP ports                   */
++
++#define TYPE_CAROLINA_SYSIO "carolina-sysio"
++OBJECT_DECLARE_SIMPLE_TYPE(CarolinaSysIoState, CAROLINA_SYSIO)
++
++struct CarolinaSysIoState {
++    ISADevice parent_obj;
++    MemoryRegion io;
++    MemoryRegion ide_io;
++    uint32_t simm_pd_packed;
++    uint8_t simm_pd[4];
++    uint8_t ide_pending;    /* 0x838: bit n = IDE channel n interrupted */
++    uint8_t ide_level;      /* current INTRQ of each channel */
++    qemu_irq ide_isa_irq;   /* ISA IRQ 13, driven by the latch */
++};
++
++/*
++ * 0x838: IDE interrupt latch.  A rising INTRQ sets its channel's bit and the
++ * latch, not the drives, drives IRQ 13; each new bit pulses the line so the
++ * edge-triggered 8259 sees it even while the other channel's bit is still
++ * set.  Writing clears the bits written as 0.
++ */
++static void carolina_ide_update(CarolinaSysIoState *s)
++{
++    qemu_set_irq(s->ide_isa_irq, s->ide_pending != 0);
++}
++
++static uint64_t carolina_ide_latch_read(void *opaque, hwaddr addr,
++                                        unsigned size)
++{
++    CarolinaSysIoState *s = opaque;
++    return 0xfc | s->ide_pending;
++}
++
++static void carolina_ide_latch_write(void *opaque, hwaddr addr, uint64_t val,
++                                     unsigned size)
++{
++    CarolinaSysIoState *s = opaque;
++
++    s->ide_pending &= val;
++    carolina_ide_update(s);
++}
++
++static const MemoryRegionOps carolina_ide_latch_ops = {
++    .read = carolina_ide_latch_read,
++    .write = carolina_ide_latch_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.max_access_size = 1,
++};
++
++static void carolina_ide_irq(void *opaque, int n, int level)
++{
++    CarolinaSysIoState *s = opaque;
++    uint8_t bit = 1 << n;
++
++    if (level && !(s->ide_level & bit)) {
++        s->ide_pending |= bit;
++        qemu_irq_lower(s->ide_isa_irq);
++        carolina_ide_update(s);
++    }
++    if (level) {
++        s->ide_level |= bit;
++    } else {
++        s->ide_level &= ~bit;
++    }
++}
++
++static uint64_t carolina_sysio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CarolinaSysIoState *s = opaque;
++    uint64_t val = 0xff;
++
++    switch (addr) {
++    case 0x00 ... 0x03:     /* 0x880: SIMM presence detect */
++        val = s->simm_pd[addr];
++        break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "carolina: sysio read  %03x\n",
++                      (unsigned)(0x880 + addr));
++        break;
++    }
++    return val;
++}
++
++static void carolina_sysio_write(void *opaque, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    qemu_log_mask(LOG_UNIMP, "carolina: sysio write %03x = %02x\n",
++                  (unsigned)(0x880 + addr), (unsigned)val);
++}
++
++static const MemoryRegionOps carolina_sysio_ops = {
++    .read = carolina_sysio_read,
++    .write = carolina_sysio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.max_access_size = 1,
++};
++
++static void carolina_sysio_realize(DeviceState *dev, Error **errp)
++{
++    CarolinaSysIoState *s = CAROLINA_SYSIO(dev);
++    int i;
++
++    for (i = 0; i < 4; i++) {
++        s->simm_pd[i] = s->simm_pd_packed >> (8 * i);
++    }
++    memory_region_init_io(&s->io, OBJECT(dev), &carolina_sysio_ops, s,
++                          "carolina-sysio", 0x80);
++    isa_register_ioport(ISA_DEVICE(dev), &s->io, 0x880);
++    memory_region_init_io(&s->ide_io, OBJECT(dev), &carolina_ide_latch_ops, s,
++                          "carolina-ide-latch", 1);
++    isa_register_ioport(ISA_DEVICE(dev), &s->ide_io, 0x838);
++    s->ide_isa_irq = isa_get_irq(ISA_DEVICE(dev), 13);
++    qdev_init_gpio_in_named(dev, carolina_ide_irq, "ide-irq", 2);
++}
++
++static const Property carolina_sysio_props[] = {
++    DEFINE_PROP_UINT32("simm-pd", CarolinaSysIoState, simm_pd_packed,
++                       0xffffffff),
++};
++
++/* The monitor's "nmi" pulls the soft reset line: a system reset interrupt */
++static void carolina_do_sreset(CPUState *cs, run_on_cpu_data arg)
++{
++    cpu_synchronize_state(cs);
++    ppc_cpu_do_system_reset(cs);
++}
++
++static void carolina_nmi(NMIState *n, int cpu_index, Error **errp)
++{
++    CPUState *cs;
++
++    CPU_FOREACH(cs) {
++        async_run_on_cpu(cs, carolina_do_sreset, RUN_ON_CPU_NULL);
++    }
++}
++
++static void carolina_sysio_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    NMIClass *nc = NMI_CLASS(klass);
++
++    dc->realize = carolina_sysio_realize;
++    device_class_set_props(dc, carolina_sysio_props);
++    nc->nmi_monitor_handler = carolina_nmi;
++}
++
++/* ------------------------------------------------------------------ */
++/* 4 KB PReP NVRAM: address 0x74/0x75, data 0x76 (0x77 too), kept in a file                   */
++
++#define TYPE_CAROLINA_NVRAM "carolina-nvram"
++OBJECT_DECLARE_SIMPLE_TYPE(CarolinaNvramState, CAROLINA_NVRAM)
++
++#define CAROLINA_NVRAM_SIZE 4096
++
++struct CarolinaNvramState {
++    ISADevice parent_obj;
++    MemoryRegion io;
++    char *filename;
++    int fd;
++    uint16_t addr;
++    uint8_t data[CAROLINA_NVRAM_SIZE];
++};
++
++/* the firmware's crcgen(), CRC-16/CCITT reflected in its own way */
++static uint16_t carolina_nvram_crcgen(uint16_t crc, uint8_t byte)
++{
++    uint32_t x = ((crc >> 8) ^ byte) & 0xff;
++    uint32_t r = x | ((crc << 8) & 0xff00);
++
++    r ^= ((x << 12) & 0xf000) | ((x >> 4) & 0x000f);
++    r ^= (x << 5) & 0x1fe0;
++    r ^= (x << 8) & 0xf000;
++    r ^= (x << 1) & 0x01e0;
++    return r;
++}
++
++static uint16_t carolina_nvram_crc(const uint8_t *d, uint32_t start,
++                                   uint32_t end)
++{
++    uint16_t crc = 0xffff;
++    uint32_t i;
++
++    for (i = start; i <= end; i++) {
++        if (i < 4 || i >= 8) {
++            crc = carolina_nvram_crcgen(crc, d[i]);
++        }
++    }
++    return crc;
++}
++
++/*
++ * What a Power Series leaves the factory with: an empty PReP 1.4 header.
++ * The global environment starts right after the 0xf8-byte header; the
++ * OS/2 console manager reads it from there without looking at GEAddress.
++ */
++static void carolina_nvram_format(uint8_t *d)
++{
++    const uint32_t ge = 0xf8, ge_len = 0xa00 - 0xf8;
++    const uint32_t os = 0xa00, os_len = 0x200;
++    const uint32_t cfg = 0xc00, cfg_len = 0;
++    uint16_t crc;
++
++    memset(d, 0, CAROLINA_NVRAM_SIZE);
++    stw_be_p(d + 0x00, CAROLINA_NVRAM_SIZE / KiB);
++    d[0x02] = 1;
++    d[0x03] = 4;
++    d[0x09] = 'B';
++    stl_be_p(d + 0xc4, ge);
++    stl_be_p(d + 0xc8, ge_len);
++    stl_be_p(d + 0xd4, cfg);
++    stl_be_p(d + 0xd8, cfg_len);
++    stl_be_p(d + 0xe8, os);
++    stl_be_p(d + 0xec, os_len);
++    crc = carolina_nvram_crc(d, 0, ge + ge_len - 1);
++    stw_be_p(d + 0x04, crc);
++    stw_be_p(d + 0x06, 0xffff);
++}
++
++static uint64_t carolina_nvram_read(void *opaque, hwaddr addr, unsigned size)
++{
++    CarolinaNvramState *s = opaque;
++
++    switch (addr) {
++    case 0:
++        return s->addr & 0xff;
++    case 1:
++        return s->addr >> 8;
++    case 2 ... 3:
++        return s->data[s->addr % CAROLINA_NVRAM_SIZE];
++    }
++    return 0xff;
++}
++
++/* positioned I/O that also builds on Windows, where there is no pread/pwrite */
++static ssize_t carolina_nvram_pio(int fd, void *buf, size_t len, off_t off,
++                                  bool wr)
++{
++    if (lseek(fd, off, SEEK_SET) != off) {
++        return -1;
++    }
++    return wr ? write(fd, buf, len) : read(fd, buf, len);
++}
++
++static void carolina_nvram_write(void *opaque, hwaddr addr, uint64_t val,
++                                 unsigned size)
++{
++    CarolinaNvramState *s = opaque;
++    uint16_t a;
++
++    switch (addr) {
++    case 0:
++        s->addr = (s->addr & 0xff00) | (val & 0xff);
++        break;
++    case 1:
++        s->addr = (s->addr & 0x00ff) | ((val & 0xff) << 8);
++        break;
++    case 2 ... 3:
++        a = s->addr % CAROLINA_NVRAM_SIZE;
++        s->data[a] = val;
++        if (s->fd >= 0 && carolina_nvram_pio(s->fd, &s->data[a], 1, a, true) != 1) {
++            error_report("carolina-nvram: write to %s failed", s->filename);
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps carolina_nvram_ops = {
++    .read = carolina_nvram_read,
++    .write = carolina_nvram_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.max_access_size = 1,
++};
++
++static void carolina_nvram_realize(DeviceState *dev, Error **errp)
++{
++    CarolinaNvramState *s = CAROLINA_NVRAM(dev);
++
++    s->fd = -1;
++    carolina_nvram_format(s->data);
++    if (s->filename) {
++        s->fd = open(s->filename, O_RDWR | O_CREAT | O_BINARY, 0644);
++        if (s->fd < 0) {
++            error_setg_errno(errp, errno, "cannot open NVRAM file %s",
++                             s->filename);
++            return;
++        }
++        if (carolina_nvram_pio(s->fd, s->data, CAROLINA_NVRAM_SIZE, 0, false) !=
++            CAROLINA_NVRAM_SIZE) {
++            carolina_nvram_format(s->data);
++            if (carolina_nvram_pio(s->fd, s->data, CAROLINA_NVRAM_SIZE, 0, true) !=
++                CAROLINA_NVRAM_SIZE) {
++                error_setg_errno(errp, errno, "cannot write NVRAM file %s",
++                                 s->filename);
++                return;
++            }
++        }
++    }
++    memory_region_init_io(&s->io, OBJECT(dev), &carolina_nvram_ops, s,
++                          "carolina-nvram", 4);
++    isa_register_ioport(ISA_DEVICE(dev), &s->io, 0x74);
++}
++
++static const Property carolina_nvram_props[] = {
++    DEFINE_PROP_STRING("file", CarolinaNvramState, filename),
++};
++
++static void carolina_nvram_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = carolina_nvram_realize;
++    device_class_set_props(dc, carolina_nvram_props);
++}
++
++/* ------------------------------------------------------------------ */
++/* Machine                                                              */
++
++static void carolina_cpu_reset(void *opaque)
++{
++    PowerPCCPU *cpu = opaque;
++
++    qemu_log_mask(LOG_UNIMP, "carolina: cpu reset\n");
++    cpu_reset(CPU(cpu));
++    cpu_ppc_tb_reset(&cpu->env);
++}
++
++/* An empty SIMM socket: the data bus floats high */
++static uint64_t carolina_nodram_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return ~0ULL;
++}
++
++static void carolina_nodram_write(void *opaque, hwaddr addr, uint64_t val,
++                                  unsigned size)
++{
++}
++
++static const MemoryRegionOps carolina_nodram_ops = {
++    .read = carolina_nodram_read,
++    .write = carolina_nodram_write,
++    .endianness = DEVICE_BIG_ENDIAN,
++    .valid.max_access_size = 8,
++    .impl.max_access_size = 8,
++};
++
++/* SIMMs the firmware's presence-detect table knows, largest first */
++static const struct {
++    uint32_t mb;
++    uint8_t pd;
++    uint8_t side_mb[2];
++} carolina_simm_types[] = {
++    { 64, 0xdd, { 32, 32 } },
++    { 32, 0xaa, { 32, 0 } },
++    { 16, 0xbb, { 8, 8 } },
++    { 8, 0x88, { 8, 0 } },
++};
++
++#define CAROLINA_SIMM_SLOTS 3
++
++/* Fill the SIMM slots for the requested RAM; returns the packed PD bytes */
++static uint32_t carolina_setup_ram(MachineState *machine, CarolinaHBDev *hb)
++{
++    uint32_t left = machine->ram_size / MiB, offset = 0, pd = 0xffffffff;
++    int slot, t, side;
++
++    hb->ram = machine->ram;
++    memory_region_init_io(&hb->banks, OBJECT(hb), &carolina_nodram_ops, hb,
++                          "carolina-dram", 1 * GiB);
++    memory_region_add_subregion(get_system_memory(), 0, &hb->banks);
++
++    for (slot = 0; slot < CAROLINA_SIMM_SLOTS && left; slot++) {
++        for (t = 0; t < ARRAY_SIZE(carolina_simm_types); t++) {
++            if (carolina_simm_types[t].mb <= left) {
++                break;
++            }
++        }
++        if (t == ARRAY_SIZE(carolina_simm_types)) {
++            break;
++        }
++        pd &= ~(0xffu << (8 * slot));
++        pd |= carolina_simm_types[t].pd << (8 * slot);
++        for (side = 0; side < 2; side++) {
++            hb->bank_mb[slot * 2 + side] = carolina_simm_types[t].side_mb[side];
++            hb->bank_offset_mb[slot * 2 + side] = offset;
++            offset += carolina_simm_types[t].side_mb[side];
++        }
++        left -= carolina_simm_types[t].mb;
++    }
++    if (left) {
++        error_report("carolina: RAM must fill up to %d SIMMs of 8/16/32/64 MB",
++                     CAROLINA_SIMM_SLOTS);
++        exit(1);
++    }
++    return pd;
++}
++
++static char *carolina_video;
++
++static char *carolina_get_video(Object *obj, Error **errp)
++{
++    return g_strdup(carolina_video ? carolina_video : "s3");
++}
++
++static void carolina_set_video(Object *obj, const char *value, Error **errp)
++{
++    g_free(carolina_video);
++    carolina_video = g_strdup(value);
++}
++
++static void carolina_init(MachineState *machine)
++{
++    uint32_t simm_pd;
++    DeviceState *sysio;
++    const char *bios_name = machine->firmware ?: "P93H1904.IMG";
++    PowerPCCPU *cpu;
++    CPUPPCState *env;
++    DeviceState *dev, *isa_bridge;
++    SysBusDevice *pcihost;
++    PCIBus *pci_bus;
++    ISABus *isa_bus;
++    ISADevice *isa_dev;
++    MemoryRegion *bios = g_new(MemoryRegion, 1);
++    char *filename;
++    ssize_t bios_size;
++
++    cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
++    env = &cpu->env;
++    if (PPC_INPUT(env) != PPC_FLAGS_INPUT_6xx) {
++        error_report("only 6xx bus is supported on this machine");
++        exit(1);
++    }
++    /* 66 MHz bus / 4, what the firmware tells the OS in the residual data */
++    cpu_ppc_tb_init(env, 16666000);
++    qemu_register_reset(carolina_cpu_reset, cpu);
++
++    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
++    if (!filename) {
++        error_report("Could not find firmware image '%s'", bios_name);
++        exit(1);
++    }
++    memory_region_init_rom(bios, NULL, "carolina.firmware", BIOS_SIZE,
++                           &error_fatal);
++    memory_region_add_subregion(get_system_memory(), BIOS_ADDR, bios);
++    bios_size = load_image_targphys(filename, BIOS_ADDR, BIOS_SIZE);
++    if (bios_size < 0) {
++        error_report("Could not load firmware image '%s'", filename);
++        exit(1);
++    }
++    g_free(filename);
++
++    dev = qdev_new(TYPE_CAROLINA_PCIHOST);
++    pcihost = SYS_BUS_DEVICE(dev);
++    object_property_add_child(qdev_get_machine(), "carolina", OBJECT(dev));
++    sysbus_realize_and_unref(pcihost, &error_fatal);
++    pci_bus = PCI_BUS(qdev_get_child_bus(dev, "pci.0"));
++    simm_pd = carolina_setup_ram(machine, carolina_hb);
++
++    isa_bridge = DEVICE(pci_new(PCI_DEVFN(11, 0), "ibm-firecoral"));
++    qdev_realize_and_unref(isa_bridge, BUS(pci_bus), &error_fatal);
++    qdev_connect_gpio_out(isa_bridge, 0,
++                          qdev_get_gpio_in(DEVICE(cpu), PPC6xx_INPUT_INT));
++    sysbus_connect_irq(pcihost, 0, qdev_get_gpio_in(isa_bridge, 15));
++    isa_bus = ISA_BUS(qdev_get_child_bus(isa_bridge, "isa.0"));
++
++    /* the keyboard controller is the one inside the PC87312 */
++
++    isa_dev = isa_new(TYPE_MC146818_RTC);
++    qdev_prop_set_int32(DEVICE(isa_dev), "base_year", 1900);
++    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
++
++    isa_create_simple(isa_bus, TYPE_CAROLINA_NVRAM);
++
++    isa_dev = isa_new("pc87312");
++    qdev_prop_set_uint32(DEVICE(isa_dev), "config", 14);
++    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
++
++    isa_dev = isa_new(TYPE_CAROLINA_SYSIO);
++    qdev_prop_set_uint32(DEVICE(isa_dev), "simm-pd", simm_pd);
++    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
++    sysio = DEVICE(isa_dev);
++
++    {
++        DriveInfo *hd[4];
++        ISADevice *ide;
++
++        /* both channels on IRQ 13, told apart through the 0x838 latch */
++        ide_drive_get(hd, 4);
++        ide = isa_ide_init(isa_bus, 0x1f0, 0x3f6, 13, hd[0], hd[1]);
++        qdev_connect_gpio_out_named(DEVICE(ide), "irq-tap", 0,
++                                    qdev_get_gpio_in_named(sysio, "ide-irq", 0));
++        ide = isa_ide_init(isa_bus, 0x170, 0x376, 13, hd[2], hd[3]);
++        qdev_connect_gpio_out_named(DEVICE(ide), "irq-tap", 0,
++                                    qdev_get_gpio_in_named(sysio, "ide-irq", 1));
++    }
++
++    isa_dev = isa_new("prep-systemio");
++    qdev_prop_set_uint32(DEVICE(isa_dev), "ibm-planar-id", 0xf0);
++    qdev_prop_set_uint32(DEVICE(isa_dev), "equipment", 0xc0);
++    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
++    qdev_connect_gpio_out_named(DEVICE(isa_dev), "little-endian", 0,
++                                qdev_get_gpio_in_named(DEVICE(pcihost),
++                                                       "little-endian", 0));
++    /*
++     * 0x850 reads 1 while the firmware runs contiguous and gets 0 right
++     * before the boot image, which then addresses I/O non-contiguously.
++     */
++    qdev_connect_gpio_out(DEVICE(isa_dev), 0,
++                          qemu_irq_invert(qdev_get_gpio_in(DEVICE(pcihost), 0)));
++
++    /*
++     * The onboard S3 Vision864 in slot 14; video=p9100 puts a Weitek P9100,
++     * the chip on IBM's S15 adapter, in PCI slot 2 instead.
++     */
++    if (carolina_video && !strcmp(carolina_video, "p9100")) {
++        pci_create_simple(pci_bus, PCI_DEVFN(13, 0), "p9100");
++    } else {
++        PCIDevice *s3 = pci_new(PCI_DEVFN(14, 0), "s3-vision864");
++
++        object_property_add_child(OBJECT(machine), "display", OBJECT(s3));
++        pci_realize_and_unref(s3, pci_bus, &error_fatal);
++    }
++
++    pci_init_nic_in_slot(pci_bus, "pcnet", NULL, "12");
++}
++
++static void carolina_machine_init(MachineClass *mc)
++{
++    mc->desc = "IBM Power Series 850 (Carolina)";
++    mc->init = carolina_init;
++    mc->max_cpus = 1;
++    mc->default_ram_size = 64 * MiB;
++    mc->default_ram_id = "carolina.ram";
++    mc->block_default_type = IF_IDE;
++    mc->default_boot_order = "cd";
++    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
++    mc->default_display = "std";
++    mc->default_nic = "pcnet";
++    object_class_property_add_str(OBJECT_CLASS(mc), "video",
++                                  carolina_get_video, carolina_set_video);
++    object_class_property_set_description(OBJECT_CLASS(mc), "video",
++                                          "display adapter: s3 (default) or p9100");
++}
++
++DEFINE_MACHINE("carolina", carolina_machine_init)
++
++static const TypeInfo carolina_types[] = {
++    {
++        .name = TYPE_CAROLINA_PCIHOST,
++        .parent = TYPE_PCI_HOST_BRIDGE,
++        .instance_size = sizeof(CarolinaPCIState),
++        .instance_init = carolina_pcihost_init,
++        .class_init = carolina_pcihost_class_init,
++    }, {
++        .name = TYPE_CAROLINA_HB_DEV,
++        .parent = TYPE_PCI_DEVICE,
++        .instance_size = sizeof(CarolinaHBDev),
++        .class_init = carolina_hb_class_init,
++        .interfaces = (const InterfaceInfo[]) {
++            { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++            { },
++        },
++    }, {
++        .name = TYPE_CAROLINA_SYSIO,
++        .parent = TYPE_ISA_DEVICE,
++        .instance_size = sizeof(CarolinaSysIoState),
++        .class_init = carolina_sysio_class_init,
++        .interfaces = (const InterfaceInfo[]) {
++            { TYPE_NMI },
++            { },
++        },
++    }, {
++        .name = TYPE_CAROLINA_NVRAM,
++        .parent = TYPE_ISA_DEVICE,
++        .instance_size = sizeof(CarolinaNvramState),
++        .class_init = carolina_nvram_class_init,
++    },
++};
++
++DEFINE_TYPES(carolina_types)
+--- a/hw/ppc/meson.build
++++ b/hw/ppc/meson.build
+@@ -67,6 +67,7 @@
+ # PReP
+ ppc_ss.add(when: 'CONFIG_PREP', if_true: files('prep.c'))
+ ppc_ss.add(when: 'CONFIG_PREP', if_true: files('prep_systemio.c'))
++ppc_ss.add(when: 'CONFIG_PREP', if_true: files('carolina.c'))
+ ppc_ss.add(when: 'CONFIG_RS6000_MC', if_true: files('rs6000_mc.c'))
+ # OldWorld PowerMac
+ ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))

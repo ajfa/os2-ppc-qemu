@@ -1,0 +1,171 @@
+--- a/hw/ide/atapi.c
++++ b/hw/ide/atapi.c
+@@ -1299,6 +1299,8 @@
+     [ 0xbb ] = { cmd_set_speed,                     NONDATA },
+     [ 0xbd ] = { cmd_mechanism_status,              0 },
+     [ 0xbe ] = { cmd_read_cd,                       CHECK_READY | CONDDATA },
++    /* SFF-8020 draft opcode for READ CD, used by 1995 PReP firmware */
++    [ 0xd4 ] = { cmd_read_cd,                       CHECK_READY | CONDDATA },
+     /* [1] handler detects and reports not ready condition itself */
+ };
+ 
+--- a/hw/ide/core.c
++++ b/hw/ide/core.c
+@@ -110,6 +110,20 @@
+     *p = cpu_to_le16(v);
+ }
+ 
++static IDEDMA ide_dma_nop;
++
++/* With no DMA engine behind the drive, do not advertise any DMA mode */
++static void ide_identify_drop_dma(IDEState *s, uint16_t *p)
++{
++    if (s->bus->dma->ops != ide_dma_nop.ops) {
++        return;
++    }
++    put_le16(p + 49, le16_to_cpu(p[49]) & ~(1 << 8));
++    put_le16(p + 62, 0);
++    put_le16(p + 63, 0);
++    put_le16(p + 88, 0);
++}
++
+ static void ide_identify_size(IDEState *s)
+ {
+     uint16_t *p = (uint16_t *)s->identify_data;
+@@ -234,6 +248,7 @@
+     }
+ 
+     ide_identify_size(s);
++    ide_identify_drop_dma(s, p);
+     s->identify_set = 1;
+ 
+ fill_buffer:
+@@ -302,6 +317,7 @@
+         put_le16(p + 111, s->wwn);
+     }
+ 
++    ide_identify_drop_dma(s, p);
+     s->identify_set = 1;
+ 
+ fill_buffer:
+@@ -1339,6 +1355,7 @@
+     default:
+     case ATA_IOPORT_WR_COMMAND:
+         ide_clear_hob(bus);
++        bus->irq_masked = false;
+         qemu_irq_lower(bus->irq);
+         ide_bus_exec_cmd(bus, val);
+         break;
+@@ -1788,16 +1805,24 @@
+     return false;
+ }
+ 
++
+ static bool cmd_packet(IDEState *s, uint8_t cmd)
+ {
++    /*
++     * Behind a controller with no DMA engine, act like an SFF-8020 drive:
++     * Features bits 1-7 are reserved and the DMA bit cannot take effect.
++     * Firmware of that era leaves SET FEATURES' 0x03 in the register.
++     */
++    bool no_dma = s->bus->dma->ops == ide_dma_nop.ops;
++
+     /* overlapping commands not supported */
+-    if (s->feature & 0x02) {
++    if ((s->feature & 0x02) && !no_dma) {
+         ide_abort_command(s);
+         return true;
+     }
+ 
+     s->status = READY_STAT | SEEK_STAT;
+-    s->atapi_dma = s->feature & 1;
++    s->atapi_dma = (s->feature & 1) && !no_dma;
+     if (s->atapi_dma) {
+         s->dma_cmd = IDE_DMA_ATAPI;
+     }
+@@ -2296,6 +2321,7 @@
+         } else {
+             ret = s->status;
+         }
++        bus->irq_masked = false;
+         qemu_irq_lower(bus->irq);
+         break;
+     }
+@@ -2371,6 +2397,11 @@
+                                          ide_bus_perform_srst, bus);
+     }
+ 
++    if ((bus->cmd & IDE_CTRL_DISABLE_IRQ) && !(val & IDE_CTRL_DISABLE_IRQ) &&
++        bus->irq_masked) {
++        bus->irq_masked = false;
++        qemu_irq_raise(bus->irq);
++    }
+     bus->cmd = val;
+ }
+ 
+@@ -2808,8 +2839,11 @@
+ 
+ void ide_bus_set_irq(IDEBus *bus)
+ {
++    /* nIEN only gates INTRQ: the interrupt stays pending behind it */
+     if (!(bus->cmd & IDE_CTRL_DISABLE_IRQ)) {
+         qemu_irq_raise(bus->irq);
++    } else {
++        bus->irq_masked = true;
+     }
+ }
+ 
+--- a/hw/ide/isa.c
++++ b/hw/ide/isa.c
+@@ -30,6 +30,7 @@
+ #include "qapi/error.h"
+ #include "qemu/module.h"
+ #include "system/dma.h"
++#include "hw/irq.h"
+ 
+ #include "hw/ide/isa.h"
+ #include "qom/object.h"
+@@ -45,8 +46,22 @@
+     uint32_t  iobase;
+     uint32_t  iobase2;
+     uint32_t  irqnum;
++    qemu_irq  isa_irq;
++    qemu_irq  irq_tap;      /* copy of the line for boards that latch it */
+ };
+ 
++static void isa_ide_set_irq(void *opaque, int n, int level)
++{
++    ISAIDEState *s = opaque;
++
++    /* a board that latches the line also drives the ISA interrupt itself */
++    if (s->irq_tap) {
++        qemu_set_irq(s->irq_tap, level);
++    } else {
++        qemu_set_irq(s->isa_irq, level);
++    }
++}
++
+ static void isa_ide_reset(DeviceState *d)
+ {
+     ISAIDEState *s = ISA_IDE(d);
+@@ -72,7 +87,9 @@
+ 
+     ide_bus_init(&s->bus, sizeof(s->bus), dev, 0, 2);
+     ide_init_ioport(&s->bus, isadev, s->iobase, s->iobase2);
+-    ide_bus_init_output_irq(&s->bus, isa_get_irq(isadev, s->irqnum));
++    s->isa_irq = isa_get_irq(isadev, s->irqnum);
++    qdev_init_gpio_out_named(dev, &s->irq_tap, "irq-tap", 1);
++    ide_bus_init_output_irq(&s->bus, qemu_allocate_irq(isa_ide_set_irq, s, 0));
+     vmstate_register_any(VMSTATE_IF(dev), &vmstate_ide_isa, s);
+     ide_bus_register_restart_cb(&s->bus);
+ }
+--- a/include/hw/ide/ide-bus.h
++++ b/include/hw/ide/ide-bus.h
+@@ -18,6 +18,7 @@
+     uint8_t unit;
+     uint8_t cmd;
+     qemu_irq irq; /* bus output */
++    bool irq_masked;  /* interrupt raised while nIEN was set */
+ 
+     int error_status;
+     uint8_t retry_unit;
